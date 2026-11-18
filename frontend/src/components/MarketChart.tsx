@@ -1,9 +1,9 @@
-
-import { useEffect, useMemo, useRef } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   createChart,
   ColorType,
   CrosshairMode,
+  PriceScaleMode,
   CandlestickSeries,
   HistogramSeries,
   type IChartApi,
@@ -22,67 +22,70 @@ export type Candle = {
   partial?: boolean;
 };
 
+type ScaleKind = 'normal' | 'log' | 'percent';
+
 const priceFormatter = new Intl.NumberFormat('en-US', {
   maximumFractionDigits: 0
 });
 
-const baseOptions = {
-  layout: {
-    background: { type: ColorType.Solid, color: '#101722' },
-    textColor: '#aab6c5',
-    fontFamily: 'Tahoma, sans-serif',
-    attributionLogo: false
-  },
-  grid: {
-    vertLines: { color: '#1c2837' },
-    horzLines: { color: '#1c2837' }
-  },
-  crosshair: {
-    mode: CrosshairMode.Normal,
-    vertLine: {
-      color: '#75869b',
-      width: 1 as const,
-      style: 2,
-      labelBackgroundColor: '#34445a'
-    },
-    horzLine: {
-      color: '#75869b',
-      labelBackgroundColor: '#34445a'
-    }
-  },
-  rightPriceScale: {
-    borderColor: '#29384b',
-    minimumWidth: 105
-  },
-  localization: {
-    locale: 'en-US',
-    priceFormatter: (price: number) => priceFormatter.format(price)
-  },
-  handleScroll: {
-    mouseWheel: true,
-    pressedMouseMove: true,
-    horzTouchDrag: true,
-    vertTouchDrag: true
-  },
-  handleScale: {
-    axisPressedMouseMove: true,
-    mouseWheel: true,
-    pinch: true
-  }
+const percentFormatter = (v: number) => `${v.toFixed(2)}%`;
+
+const CHART_HEIGHT = 520;
+
+const modeMap: Record<ScaleKind, PriceScaleMode> = {
+  normal: PriceScaleMode.Normal,
+  log: PriceScaleMode.Logarithmic,
+  percent: PriceScaleMode.Percentage
 };
 
+const toolbarStyle: React.CSSProperties = {
+  position: 'absolute',
+  top: 8,
+  right: 118,
+  zIndex: 3,
+  display: 'flex',
+  gap: 4,
+  direction: 'ltr'
+};
+
+const legendStyle: React.CSSProperties = {
+  position: 'absolute',
+  top: 8,
+  left: 12,
+  zIndex: 3,
+  display: 'flex',
+  gap: 12,
+  flexWrap: 'wrap',
+  fontSize: 11,
+  direction: 'ltr',
+  pointerEvents: 'none',
+  color: '#aab6c5'
+};
+
+function toolButton(active: boolean): React.CSSProperties {
+  return {
+    background: active ? '#173c3a' : 'rgba(24,36,51,0.85)',
+    color: active ? '#53d4b0' : '#aab6c5',
+    border: `1px solid ${active ? '#23685c' : '#29384b'}`,
+    borderRadius: 6,
+    padding: '3px 9px',
+    fontSize: 11,
+    cursor: 'pointer',
+    fontFamily: 'inherit'
+  };
+}
+
 export default function MarketChart({ data }: { data: Candle[] }) {
-  const priceHost = useRef<HTMLDivElement>(null);
-  const volumeHost = useRef<HTMLDivElement>(null);
+  const host = useRef<HTMLDivElement>(null);
 
-  const priceChart = useRef<IChartApi | null>(null);
-  const volumeChart = useRef<IChartApi | null>(null);
-
+  const chartRef = useRef<IChartApi | null>(null);
   const candleSeries = useRef<ISeriesApi<'Candlestick'> | null>(null);
   const volumeSeries = useRef<ISeriesApi<'Histogram'> | null>(null);
 
-  const syncing = useRef(false);
   const fitted = useRef(false);
+
+  const [scaleKind, setScaleKind] = useState<ScaleKind>('normal');
+  const [hover, setHover] = useState<Candle | null>(null);
 
   const sorted = useMemo(() => {
     const map = new Map<number, Candle>();
@@ -111,45 +114,73 @@ export default function MarketChart({ data }: { data: Candle[] }) {
     return [...map.values()].sort((a, b) => a.time - b.time);
   }, [data]);
 
-  // ساخت نمودارها
+  // نگه‌داشتن آخرین داده برای استفاده در کراس‌هیر
+  const sortedRef = useRef<Candle[]>([]);
+  sortedRef.current = sorted;
+
+  // ساخت نمودار (قیمت + حجم روی یک نمودار، مثل TradingView)
   useEffect(() => {
-    if (!priceHost.current || !volumeHost.current) return;
+    if (!host.current) return;
 
-    const price = createChart(priceHost.current, {
-      ...baseOptions,
-      width: priceHost.current.clientWidth,
-      height: 390,
-      timeScale: {
-        visible: false,
-        borderVisible: false,
-        rightOffset: 8,
-        barSpacing: 9,
-        minBarSpacing: 2,
-        timeVisible: true,
-        secondsVisible: false
-      }
-    });
-
-    const volume = createChart(volumeHost.current, {
-      ...baseOptions,
-      width: volumeHost.current.clientWidth,
-      height: 125,
+    const chart = createChart(host.current, {
+      width: host.current.clientWidth,
+      height: CHART_HEIGHT,
+      layout: {
+        background: { type: ColorType.Solid, color: '#101722' },
+        textColor: '#aab6c5',
+        fontFamily: 'Tahoma, sans-serif',
+        attributionLogo: false
+      },
+      grid: {
+        vertLines: { color: '#162130' },
+        horzLines: { color: '#162130' }
+      },
+      crosshair: {
+        mode: CrosshairMode.Normal,
+        vertLine: {
+          color: '#75869b',
+          width: 1,
+          style: 2,
+          labelBackgroundColor: '#34445a'
+        },
+        horzLine: {
+          color: '#75869b',
+          labelBackgroundColor: '#34445a'
+        }
+      },
       rightPriceScale: {
-        visible: false,
-        borderVisible: false
+        borderColor: '#29384b',
+        minimumWidth: 105,
+        // کندل‌ها بالاتر از حجم قرار می‌گیرند
+        scaleMargins: { top: 0.08, bottom: 0.25 }
       },
       timeScale: {
-        visible: true,
         borderColor: '#29384b',
         rightOffset: 8,
         barSpacing: 9,
         minBarSpacing: 2,
         timeVisible: true,
         secondsVisible: false
+      },
+      localization: {
+        locale: 'en-US',
+        priceFormatter: (price: number) => priceFormatter.format(price),
+        percentageFormatter: percentFormatter
+      },
+      handleScroll: {
+        mouseWheel: true,
+        pressedMouseMove: true,
+        horzTouchDrag: true,
+        vertTouchDrag: true
+      },
+      handleScale: {
+        axisPressedMouseMove: true,
+        mouseWheel: true,
+        pinch: true
       }
     });
 
-    const candles = price.addSeries(CandlestickSeries, {
+    const candles = chart.addSeries(CandlestickSeries, {
       upColor: '#18b995',
       downColor: '#e05260',
       borderUpColor: '#18b995',
@@ -159,91 +190,72 @@ export default function MarketChart({ data }: { data: Candle[] }) {
       priceFormat: {
         type: 'custom',
         minMove: 1,
-        formatter: (price: number) => priceFormatter.format(price)
+        formatter: (p: number) => priceFormatter.format(p)
       },
       lastValueVisible: true,
       priceLineVisible: true
     });
 
-    const volumes = volume.addSeries(HistogramSeries, {
+    // حجم: هیستوگرام روی مقیاس جداگانه (overlay) در ۲۰٪ پایین نمودار
+    const volumes = chart.addSeries(HistogramSeries, {
       priceFormat: { type: 'volume' },
+      priceScaleId: '',
       lastValueVisible: false,
       priceLineVisible: false,
       base: 0
     });
 
     volumes.priceScale().applyOptions({
-      scaleMargins: {
-        top: 0.08,
-        bottom: 0
-      }
+      scaleMargins: { top: 0.8, bottom: 0 }
     });
 
-    priceChart.current = price;
-    volumeChart.current = volume;
+    chartRef.current = chart;
     candleSeries.current = candles;
     volumeSeries.current = volumes;
 
-    // هماهنگ کردن محدوده زمانی دو نمودار
-    const syncPrice = () => {
-      if (syncing.current) return;
+    // لجند OHLC هنگام حرکت ماوس
+    const onMove = (param: any) => {
+      const bar = param?.seriesData?.get(candles);
 
-      const range = price.timeScale().getVisibleLogicalRange();
-      if (!range) return;
-
-      syncing.current = true;
-      volume.timeScale().setVisibleLogicalRange(range);
-      syncing.current = false;
-    };
-
-    const syncVolume = () => {
-      if (syncing.current) return;
-
-      const range = volume.timeScale().getVisibleLogicalRange();
-      if (!range) return;
-
-      syncing.current = true;
-      price.timeScale().setVisibleLogicalRange(range);
-      syncing.current = false;
-    };
-
-    price.timeScale().subscribeVisibleLogicalRangeChange(syncPrice);
-    volume.timeScale().subscribeVisibleLogicalRangeChange(syncVolume);
-
-    const observer = new ResizeObserver(() => {
-      if (priceHost.current) {
-        price.applyOptions({
-          width: priceHost.current.clientWidth
-        });
+      if (!param?.time || !bar) {
+        setHover(null);
+        return;
       }
 
-      if (volumeHost.current) {
-        volume.applyOptions({
-          width: volumeHost.current.clientWidth
-        });
+      const found = sortedRef.current.find(c => c.time === Number(param.time));
+      setHover(found ?? null);
+    };
+
+    chart.subscribeCrosshairMove(onMove);
+
+    const observer = new ResizeObserver(() => {
+      if (host.current) {
+        chart.applyOptions({ width: host.current.clientWidth });
       }
     });
 
-    observer.observe(priceHost.current);
-    observer.observe(volumeHost.current);
+    observer.observe(host.current);
 
     return () => {
       observer.disconnect();
+      chart.unsubscribeCrosshairMove(onMove);
+      chart.remove();
 
-      price.timeScale().unsubscribeVisibleLogicalRangeChange(syncPrice);
-      volume.timeScale().unsubscribeVisibleLogicalRangeChange(syncVolume);
-
-      price.remove();
-      volume.remove();
-
-      priceChart.current = null;
-      volumeChart.current = null;
+      chartRef.current = null;
       candleSeries.current = null;
       volumeSeries.current = null;
 
       fitted.current = false;
     };
   }, []);
+
+  // تغییر حالت مقیاس قیمت (عادی / لگاریتمی / درصدی)
+  useEffect(() => {
+    chartRef.current?.priceScale('right').applyOptions({
+      mode: modeMap[scaleKind],
+      autoScale: true
+    });
+  }, [scaleKind]);
 
   // بروزرسانی اطلاعات
   useEffect(() => {
@@ -271,18 +283,71 @@ export default function MarketChart({ data }: { data: Candle[] }) {
 
     // فقط بار اول نمودار را روی تمام تاریخچه تنظیم کن
     if (sorted.length && !fitted.current) {
-      priceChart.current?.timeScale().fitContent();
+      chartRef.current?.timeScale().fitContent();
       fitted.current = true;
     }
   }, [sorted]);
 
+  const fit = () => {
+    chartRef.current?.priceScale('right').applyOptions({ autoScale: true });
+    chartRef.current?.timeScale().fitContent();
+  };
+
+  const shown = hover ?? sorted[sorted.length - 1] ?? null;
+  const up = shown ? shown.close >= shown.open : true;
+  const changePct = shown && shown.open
+    ? ((shown.close - shown.open) / shown.open) * 100
+    : null;
+  const color = up ? '#18b995' : '#e05260';
+
   return (
-    <div className="market-chart">
-      <div className="chart-price" ref={priceHost} />
-      <div className="chart-volume">
-        <div className="volume-label">حجم معاملات</div>
-        <div className="chart-volume-host" ref={volumeHost} />
+    <div
+      className="market-chart"
+      style={{ position: 'relative', direction: 'ltr' }}
+    >
+      {shown && (
+        <div style={legendStyle}>
+          <span>O <b style={{ color }}>{priceFormatter.format(shown.open)}</b></span>
+          <span>H <b style={{ color }}>{priceFormatter.format(shown.high)}</b></span>
+          <span>L <b style={{ color }}>{priceFormatter.format(shown.low)}</b></span>
+          <span>C <b style={{ color }}>{priceFormatter.format(shown.close)}</b></span>
+          {changePct != null && (
+            <b style={{ color }}>
+              {changePct >= 0 ? '+' : ''}{changePct.toFixed(2)}%
+            </b>
+          )}
+          <span>Vol <b style={{ color: '#aab6c5' }}>{priceFormatter.format(shown.volume)}</b></span>
+        </div>
+      )}
+
+      <div style={toolbarStyle}>
+        <button
+          type="button"
+          style={toolButton(scaleKind === 'log')}
+          onClick={() => setScaleKind(k => (k === 'log' ? 'normal' : 'log'))}
+          title="مقیاس لگاریتمی"
+        >
+          Log
+        </button>
+        <button
+          type="button"
+          style={toolButton(scaleKind === 'percent')}
+          onClick={() => setScaleKind(k => (k === 'percent' ? 'normal' : 'percent'))}
+          title="مقیاس درصدی"
+        >
+          %
+        </button>
+        <button
+          type="button"
+          style={toolButton(false)}
+          onClick={fit}
+          title="نمایش کل تاریخچه و اتواسکیل"
+        >
+          Fit
+        </button>
       </div>
+
+      <div ref={host} style={{ width: '100%', height: CHART_HEIGHT }} />
     </div>
   );
 }

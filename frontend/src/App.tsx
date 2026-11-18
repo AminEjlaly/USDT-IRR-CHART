@@ -1,10 +1,11 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { io } from 'socket.io-client';
 import { Activity, Wifi, WifiOff, RefreshCw } from 'lucide-react';
 import MarketChart, { type Candle } from './components/MarketChart';
 
 const API = import.meta.env.VITE_API_URL || 'http://localhost:4000';
-const timeframes = ['1m','5m','15m','1h','4h','1d'];
+const timeframes = ['1d','4h','1h','30m','15m','5m','1m'];
+const REFRESH_MS = 5000;
 
 type Exchange = { Code: string; DisplayName: string; IsEnabled: boolean; LastSuccessAt: string | null; LastError: string | null };
 
@@ -15,6 +16,9 @@ export default function App() {
   const [connected, setConnected] = useState(false);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
+
+  const candlesRef = useRef<Candle[]>([]);
+  candlesRef.current = candles;
 
   async function load() {
     setLoading(true);
@@ -30,22 +34,45 @@ export default function App() {
     finally { setLoading(false); }
   }
 
-  useEffect(() => { load(); }, [timeframe]);
+  useEffect(() => { setCandles([]); load(); }, [timeframe]);
+
+  // رفرش خودکار هر ۵ ثانیه: فقط کندل‌های آخر را می‌گیرد و با لیست فعلی ادغام می‌کند
+  useEffect(() => {
+    let stopped = false;
+    let busy = false;
+
+    const tick = async () => {
+      if (busy) return;
+      busy = true;
+      try {
+        const lastTime = candlesRef.current[candlesRef.current.length - 1]?.time
+          ?? Math.floor(Date.now() / 1000) - 86400;
+        const r = await fetch(`${API}/api/candles?timeframe=${timeframe}&since=${lastTime}`);
+        if (!r.ok) return;
+        const json = await r.json();
+        const updates = json.data as Candle[] | undefined;
+        if (stopped || !updates?.length) return;
+        setCandles(old => {
+          const map = new Map(old.map(x => [x.time, x]));
+          for (const x of updates) map.set(x.time, x);
+          return [...map.values()].sort((a, b) => a.time - b.time).slice(-1500);
+        });
+        setError('');
+      } catch { /* رفرش بعدی دوباره تلاش می‌کند */ }
+      finally { busy = false; }
+    };
+
+    const id = setInterval(tick, REFRESH_MS);
+    return () => { stopped = true; clearInterval(id); };
+  }, [timeframe]);
+
+  // سوکت فقط برای نمایش وضعیت اتصال
   useEffect(() => {
     const socket = io(API, { transports: ['websocket','polling'] });
     socket.on('connect', () => setConnected(true));
     socket.on('disconnect', () => setConnected(false));
-    socket.on('market:update', payload => {
-      const updates = payload?.candles?.[timeframe] as Candle[] | undefined;
-      if (!updates?.length) return;
-      setCandles(old => {
-        const map = new Map(old.map(x => [x.time, x]));
-        for (const x of updates) map.set(x.time, x);
-        return [...map.values()].sort((a,b) => a.time-b.time).slice(-1500);
-      });
-    });
     return () => { socket.disconnect(); };
-  }, [timeframe]);
+  }, []);
 
   const last = candles[candles.length - 1];
   const previous = candles[candles.length - 2];

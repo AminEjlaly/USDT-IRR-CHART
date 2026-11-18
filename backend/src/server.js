@@ -1,4 +1,3 @@
-
 import express from 'express';
 import cors from 'cors';
 import { createServer } from 'node:http';
@@ -38,8 +37,9 @@ app.get('/api/candles', async (req, res) => {
   try {
     const timeframe = String(req.query.timeframe || '1m');
     const limit = Number(req.query.limit || 5000);
+    const since = req.query.since ? Number(req.query.since) : null;
 
-    const rows = await getCandles(timeframe, limit);
+    const rows = await getCandles(timeframe, limit, since);
 
     res.json({
       symbol: 'USDT/IRR',

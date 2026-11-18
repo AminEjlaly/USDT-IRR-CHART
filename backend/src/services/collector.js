@@ -20,31 +20,30 @@ export async function collectOnce(io) {
       }
     }
 
+    // فقط کندل ۱ دقیقه‌ای ذخیره می‌شود؛ بقیه تایم‌فریم‌ها از روی آن ساخته می‌شوند.
     const snapshots = {};
-    for (const [name, tf] of Object.entries(TIMEFRAMES)) {
-      // Rebuild the currently forming candle from every persisted tick since its open.
-      // This avoids losing earlier high/low/open values when an exchange only returns
-      // a limited page of its most recent trades.
-      const candleStart = floorTime(new Date(), tf.seconds);
-      const ticks = await getTicksSince(candleStart);
-      const byExchange = new Map();
-      for (const tick of ticks) {
-        if (!byExchange.has(tick.exchange)) byExchange.set(tick.exchange, []);
-        byExchange.get(tick.exchange).push(tick);
-      }
-      const perExchangeCandles = [];
-      for (const rows of byExchange.values()) {
-        perExchangeCandles.push(...buildTradeCandles(rows, tf.seconds));
-      }
-      const composite = aggregateExchangeCandles(perExchangeCandles);
-      if (composite.length) {
-        await saveCompositeCandles(name, composite, true);
-        snapshots[name] = composite.map(c => ({
-          time: Math.floor(c.time.getTime() / 1000),
-          open: c.open, high: c.high, low: c.low, close: c.close,
-          volume: c.volume, sourceCount: c.sourceCount
-        }));
-      }
+    const tf = TIMEFRAMES['1m'];
+
+    // کندل در حال تشکیل را از تمام تیک‌های ذخیره‌شده از ابتدای آن بازسازی می‌کنیم.
+    const candleStart = floorTime(new Date(), tf.seconds);
+    const ticks = await getTicksSince(candleStart);
+    const byExchange = new Map();
+    for (const tick of ticks) {
+      if (!byExchange.has(tick.exchange)) byExchange.set(tick.exchange, []);
+      byExchange.get(tick.exchange).push(tick);
+    }
+    const perExchangeCandles = [];
+    for (const rows of byExchange.values()) {
+      perExchangeCandles.push(...buildTradeCandles(rows, tf.seconds));
+    }
+    const composite = aggregateExchangeCandles(perExchangeCandles);
+    if (composite.length) {
+      await saveCompositeCandles('1m', composite, true);
+      snapshots['1m'] = composite.map(c => ({
+        time: Math.floor(c.time.getTime() / 1000),
+        open: c.open, high: c.high, low: c.low, close: c.close,
+        volume: c.volume, sourceCount: c.sourceCount
+      }));
     }
     if (Object.keys(snapshots).length) io.emit('market:update', { candles: snapshots, updatedAt: new Date().toISOString() });
   } finally { running = false; }

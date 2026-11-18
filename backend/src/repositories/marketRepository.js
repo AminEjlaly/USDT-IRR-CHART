@@ -1,4 +1,3 @@
-
 import { createHash } from 'node:crypto';
 import { getPool, sql } from '../db.js';
 import { TIMEFRAMES, floorTime } from '../utils/timeframes.js';
@@ -221,61 +220,27 @@ function median(values) {
     : (sorted[middle - 1] + sorted[middle]) / 2;
 }
 
-// ابتدا کندل‌های هر صرافی را در تایم‌فریم مقصد هم‌تراز می‌کند.
-// سپس کندل‌های صرافی‌ها را برای هر زمان ترکیب می‌کند.
-function buildHistoricalComposite(rows, seconds) {
-  const perExchange = new Map();
-
-  for (const row of rows) {
-    const time = new Date(row.CandleTime);
-    const bucket = floorTime(time, seconds);
-    const key = `${row.ExchangeCode}|${bucket.getTime()}`;
-
-    let candle = perExchange.get(key);
-
-    if (!candle) {
-      candle = {
-        exchange: row.ExchangeCode,
-        time: bucket,
-        firstTime: time,
-        lastTime: time,
-        open: Number(row.Open),
-        high: Number(row.High),
-        low: Number(row.Low),
-        close: Number(row.Close),
-        volume: Number(row.Volume) || 0
-      };
-
-      perExchange.set(key, candle);
-      continue;
-    }
-
-    candle.high = Math.max(candle.high, Number(row.High));
-    candle.low = Math.min(candle.low, Number(row.Low));
-    candle.volume += Number(row.Volume) || 0;
-
-    if (time < candle.firstTime) {
-      candle.firstTime = time;
-      candle.open = Number(row.Open);
-    }
-
-    if (time >= candle.lastTime) {
-      candle.lastTime = time;
-      candle.close = Number(row.Close);
-    }
-  }
-
+// کندل‌های ۱ دقیقه‌ای صرافی‌ها را برای هر دقیقه ترکیب می‌کند.
+function buildMinuteComposite(rows) {
   const byTime = new Map();
 
-  for (const candle of perExchange.values()) {
-    const key = candle.time.getTime();
+  for (const row of rows) {
+    const key = new Date(row.CandleTime).getTime();
 
     if (!byTime.has(key)) byTime.set(key, []);
-    byTime.get(key).push(candle);
+
+    byTime.get(key).push({
+      exchange: row.ExchangeCode,
+      open: Number(row.Open),
+      high: Number(row.High),
+      low: Number(row.Low),
+      close: Number(row.Close),
+      volume: Number(row.Volume) || 0
+    });
   }
 
   return [...byTime.entries()].map(([time, sources]) => ({
-    time: new Date(Number(time)),
+    time: new Date(time),
     open: median(sources.map(x => x.open)),
     high: Math.max(...sources.map(x => x.high)),
     low: Math.min(...sources.map(x => x.low)),
@@ -283,10 +248,49 @@ function buildHistoricalComposite(rows, seconds) {
     volume: sources.reduce((sum, x) => sum + x.volume, 0),
     sourceCount: new Set(sources.map(x => x.exchange)).size,
     partial: false
-  })).sort((a, b) => a.time - b.time);
+  }));
 }
 
-export async function getCandles(timeframe, limit = 500) {
+// کندل‌های ۱ دقیقه‌ای (مرتب‌شده صعودی) را به تایم‌فریم بزرگ‌تر تبدیل می‌کند.
+function aggregateTo(candles, seconds) {
+  const out = [];
+  let cur = null;
+
+  for (const c of candles) {
+    const bucket =
+      Math.floor(c.time.getTime() / 1000 / seconds) * seconds * 1000;
+
+    if (!cur || cur.bucket !== bucket) {
+      cur = {
+        bucket,
+        time: new Date(bucket),
+        open: c.open,
+        high: c.high,
+        low: c.low,
+        close: c.close,
+        volume: c.volume,
+        sourceCount: c.sourceCount,
+        partial: c.partial
+      };
+
+      out.push(cur);
+      continue;
+    }
+
+    cur.high = Math.max(cur.high, c.high);
+    cur.low = Math.min(cur.low, c.low);
+    cur.close = c.close;
+    cur.volume += c.volume;
+    cur.sourceCount = Math.max(cur.sourceCount, c.sourceCount);
+    cur.partial = cur.partial || c.partial;
+  }
+
+  return out;
+}
+
+// همیشه از کندل‌های ۱ دقیقه‌ای می‌سازد.
+// since (ثانیه یونیکس): فقط از ابتدای کندلِ آن زمان به بعد را برمی‌گرداند (برای رفرش سریع).
+export async function getCandles(timeframe, limit = 500, since = null) {
   const tf = TIMEFRAMES[timeframe];
 
   if (!tf) {
@@ -294,64 +298,82 @@ export async function getCandles(timeframe, limit = 500) {
   }
 
   const safeLimit = Math.min(Math.max(Number(limit) || 500, 1), 5000);
+  const minutesPerCandle = tf.seconds / 60;
+  const rawLimit = Math.min(safeLimit * minutesPerCandle * 2, 400000);
+
+  const sinceSec = Number(since);
+  const useSince = Number.isFinite(sinceSec) && sinceSec > 0;
 
   const pool = await getPool();
 
-  // در صورت وجود داده‌های ریزتر با برچسب تایم‌فریم بزرگ‌تر،
-  // رکوردهای بیشتری می‌خوانیم تا بعد از هم‌ترازسازی تاریخچه ناقص نشود.
-  const rawLimit = Math.min(safeLimit * 40, 250000);
+  const exchangeReq = pool.request().input('tf', sql.VarChar(10), '1m');
+  const marketReq = pool.request().input('tf', sql.VarChar(10), '1m');
 
-  const exchangeResult = await pool.request()
-    .input('tf', sql.VarChar(10), timeframe)
-    .input('rawLimit', sql.Int, rawLimit)
-    .query(`
-      SELECT TOP (@rawLimit)
-        e.Code AS ExchangeCode,
-        c.CandleTime,
-        c.[Open],
-        c.High,
-        c.Low,
-        c.[Close],
-        c.Volume
+  let exchangeQuery;
+  let marketQuery;
+
+  if (useSince) {
+    const from = floorTime(new Date(sinceSec * 1000), tf.seconds);
+
+    exchangeReq.input('from', sql.DateTime2(0), from);
+    marketReq.input('from', sql.DateTime2(0), from);
+
+    exchangeQuery = `
+      SELECT e.Code AS ExchangeCode, c.CandleTime,
+             c.[Open], c.High, c.Low, c.[Close], c.Volume
       FROM dbo.ExchangeCandles c
-      INNER JOIN dbo.Exchanges e
-        ON e.ExchangeId = c.ExchangeId
+      INNER JOIN dbo.Exchanges e ON e.ExchangeId = c.ExchangeId
+      WHERE c.Timeframe = @tf AND c.CandleTime >= @from
+      ORDER BY c.CandleTime ASC;
+    `;
+
+    marketQuery = `
+      SELECT CandleTime, [Open], High, Low, [Close],
+             Volume, SourceCount, IsPartial
+      FROM dbo.MarketCandles
+      WHERE Timeframe = @tf AND CandleTime >= @from
+      ORDER BY CandleTime ASC;
+    `;
+  } else {
+    exchangeReq.input('rawLimit', sql.Int, rawLimit);
+    marketReq.input('rawLimit', sql.Int, rawLimit);
+
+    exchangeQuery = `
+      SELECT TOP (@rawLimit)
+        e.Code AS ExchangeCode, c.CandleTime,
+        c.[Open], c.High, c.Low, c.[Close], c.Volume
+      FROM dbo.ExchangeCandles c
+      INNER JOIN dbo.Exchanges e ON e.ExchangeId = c.ExchangeId
       WHERE c.Timeframe = @tf
       ORDER BY c.CandleTime DESC;
-    `);
+    `;
 
-  const historical = buildHistoricalComposite(
-    exchangeResult.recordset,
-    tf.seconds
-  );
-
-  // کندل‌های زنده و تجمیع‌شده از MarketCandles خوانده می‌شوند.
-  const marketResult = await pool.request()
-    .input('tf', sql.VarChar(10), timeframe)
-    .input('limit', sql.Int, safeLimit)
-    .query(`
-      SELECT TOP (@limit)
-        CandleTime,
-        [Open],
-        High,
-        Low,
-        [Close],
-        Volume,
-        SourceCount,
-        IsPartial
+    marketQuery = `
+      SELECT TOP (@rawLimit)
+        CandleTime, [Open], High, Low, [Close],
+        Volume, SourceCount, IsPartial
       FROM dbo.MarketCandles
       WHERE Timeframe = @tf
       ORDER BY CandleTime DESC;
-    `);
+    `;
+  }
+
+  const [exchangeResult, marketResult] = await Promise.all([
+    exchangeReq.query(exchangeQuery),
+    marketReq.query(marketQuery)
+  ]);
+
+  // اگر خواندن در انتها قطع شده، اولین کندل بزرگ ناقص است و حذف می‌شود.
+  const truncated =
+    !useSince && exchangeResult.recordset.length >= rawLimit;
 
   const merged = new Map();
 
-  for (const candle of historical) {
+  for (const candle of buildMinuteComposite(exchangeResult.recordset)) {
     merged.set(candle.time.getTime(), candle);
   }
 
-  // داده MarketCandles برای زمان یکسان اولویت دارد؛
-  // چون این جدول توسط Collector به‌روزرسانی می‌شود.
+  // داده زنده (Collector) برای همان دقیقه اولویت دارد.
   for (const row of marketResult.recordset) {
     const time = new Date(row.CandleTime);
 
@@ -367,8 +389,15 @@ export async function getCandles(timeframe, limit = 500) {
     });
   }
 
-  return [...merged.values()]
-    .sort((a, b) => a.time - b.time)
+  const minutes = [...merged.values()].sort((a, b) => a.time - b.time);
+
+  let result = aggregateTo(minutes, tf.seconds);
+
+  if (truncated && result.length > 1) {
+    result = result.slice(1);
+  }
+
+  return result
     .slice(-safeLimit)
     .map(candle => ({
       time: Math.floor(candle.time.getTime() / 1000),
